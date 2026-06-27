@@ -1,6 +1,6 @@
 # ICANN & IANA Registrar Data
 
-Merged list of ICANN-accredited registrars and IANA registrar IDs.
+Consolidated registrar information from ICANN accreditation list and IANA registrar registry with JSON structure including accreditation status, contacts and RDAP endpoints.
 
 ## Data sources
 
@@ -27,7 +27,8 @@ Each entry contains:
 - `status` — Accredited, Terminated, or Reserved
 - `website` — registrar's website URL
 - `rdap_url` — RDAP base URL
+- `whois_server` — WHOIS server hostname (probed from RDAP port43 field, may be null)
 - `country` — country of registration
-- `contact_name` — public contact person
-- `contact_phone` — contact phone number
-- `contact_email` — contact email address
+- `contact.name` — public contact person
+- `contact.phone` — contact phone number
+- `contact.email` — contact email address
