@@ -12,18 +12,21 @@ Output: merged_registrars.json (list of objects)
 """
 
 import csv
+import concurrent.futures
 import io
 import json
+import os
 import sys
 import time
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 import requests
 
-JSON_OUTPUT = "merged_registrars.json"
+JSON_OUTPUT = os.path.join(SCRIPT_DIR, "merged_registrars.json")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "curl/8.21.0",
 }
 
 # ---------------------------------------------------------------------------
@@ -44,11 +47,10 @@ def fetch_iana():
             "registrar_name": row.get("Registrar Name", "").strip(),
             "status": row.get("Status", "").strip(),
             "rdap_url": row.get("RDAP Base URL", "").strip(),
+            "whois_server": None,
             "website": None,
             "country": None,
-            "contact_name": None,
-            "contact_phone": None,
-            "contact_email": None,
+            "contact": {"name": None, "phone": None, "email": None},
         }
     print(f"  → {len(records)} registrars from IANA", file=sys.stderr)
     return records
@@ -117,9 +119,9 @@ def merge(iana_records, icann_list):
             merged[rid]["website"] = ic.get("url") or None
             merged[rid]["country"] = ic.get("country") or None
             pc = ic.get("publicContact") or {}
-            merged[rid]["contact_name"] = pc.get("name") or None
-            merged[rid]["contact_email"] = pc.get("email") or None
-            merged[rid]["contact_phone"] = pc.get("phone") or None
+            merged[rid]["contact"]["name"] = pc.get("name") or None
+            merged[rid]["contact"]["email"] = pc.get("email") or None
+            merged[rid]["contact"]["phone"] = pc.get("phone") or None
 
     # Any ICANN-only entries (shouldn't happen, but be safe)
     for num, ic in icann_by_id.items():
@@ -130,14 +132,122 @@ def merge(iana_records, icann_list):
                 "registrar_name": ic.get("name", ""),
                 "status": "Accredited",
                 "rdap_url": "",
+                "whois_server": None,
                 "website": ic.get("url") or None,
                 "country": ic.get("country") or None,
-                "contact_name": pc.get("name") or None,
-                "contact_phone": pc.get("phone") or None,
-                "contact_email": pc.get("email") or None,
+                "contact": {
+                    "name": pc.get("name") or None,
+                    "phone": pc.get("phone") or None,
+                    "email": pc.get("email") or None,
+                },
             }
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# 3b. Attempt WHOIS server discovery via RDAP port43 field
+# ---------------------------------------------------------------------------
+
+def _extract_main_domain(url: str) -> str | None:
+    """Extract the registrable domain from a URL (e.g. rdap.godaddy.com -> godaddy.com)."""
+    import re
+    from urllib.parse import urlparse
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return None
+        # Handle rdap.example.co.uk type cases
+        parts = hostname.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return hostname
+    except Exception:
+        return None
+
+
+def _probe_port43(rdap_base: str, website: str | None = None) -> str | None:
+    """Try to extract port43 from an RDAP server. Returns None on failure."""
+    base = rdap_base.rstrip("/")
+
+    # Build candidate domains to query: extract from RDAP URL, then website
+    candidates = set()
+    d = _extract_main_domain(rdap_base)
+    if d:
+        candidates.add(d)
+    if website and website.startswith("http"):
+        d2 = _extract_main_domain(website)
+        if d2:
+            candidates.add(d2)
+
+    # Try /domain/{candidate_domain} for each candidate
+    for domain in candidates:
+        try:
+            r = requests.get(
+                f"{base}/domain/{domain}",
+                timeout=10,
+                headers=HEADERS,
+            )
+            ct = r.headers.get("content-type", "")
+            if "json" not in ct and not r.text.startswith("{"):
+                continue
+            data = r.json()
+            if isinstance(data, dict):
+                port43 = data.get("port43")
+                if port43 and isinstance(port43, str) and port43.strip():
+                    return port43.strip()
+        except Exception:
+            pass
+
+    # Fallback: try the root endpoint
+    try:
+        r = requests.get(
+            f"{base}/",
+            timeout=10,
+            headers=HEADERS,
+        )
+        if r.headers.get("content-type", "").startswith("application/json") or r.text.startswith("{"):
+            data = r.json()
+            if isinstance(data, dict):
+                port43 = data.get("port43")
+                if port43 and isinstance(port43, str) and port43.strip():
+                    return port43.strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def fetch_whois_servers(records: dict) -> dict:
+    """Try to get whois_server from each unique RDAP endpoint."""
+    # Deduplicate by RDAP URL to avoid hammering the same server repeatedly
+    rdap_to_records: dict[str, list[str]] = {}
+    for rid, rec in records.items():
+        url = rec.get("rdap_url")
+        if url:
+            rdap_to_records.setdefault(url, []).append(rid)
+
+    print(f"  Probing {len(rdap_to_records)} unique RDAP endpoints for port43 ...", file=sys.stderr)
+
+    found = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+        fut_map = {
+            ex.submit(_probe_port43, url, records[rids[0]].get("website")): (url, rids)
+            for url, rids in rdap_to_records.items()
+        }
+        for fut in concurrent.futures.as_completed(fut_map):
+            url, rids = fut_map[fut]
+            try:
+                port43 = fut.result()
+                if port43:
+                    for rid in rids:
+                        records[rid]["whois_server"] = port43
+                    found += 1
+            except Exception:
+                pass
+
+    print(f"    → {found}/{len(rdap_to_records)} endpoints returned port43", file=sys.stderr)
+    return records
 
 # ---------------------------------------------------------------------------
 # 4. Export JSON
@@ -156,19 +266,23 @@ def main():
     icann = fetch_icann()
     merged = merge(iana, icann)
 
+    merged = fetch_whois_servers(merged)
+
     write_json(merged, JSON_OUTPUT)
 
     accredited = sum(1 for r in merged.values() if r["status"] == "Accredited")
     terminated = sum(1 for r in merged.values() if r["status"] == "Terminated")
     with_website = sum(1 for r in merged.values() if r.get("website"))
     with_country = sum(1 for r in merged.values() if r.get("country"))
+    with_whois = sum(1 for r in merged.values() if r.get("whois_server"))
     print(file=sys.stderr)
     print(f"Summary:", file=sys.stderr)
-    print(f"  Total:        {len(merged)}", file=sys.stderr)
-    print(f"  Accredited:   {accredited}", file=sys.stderr)
-    print(f"  Terminated:   {terminated}", file=sys.stderr)
-    print(f"  With website: {with_website}", file=sys.stderr)
-    print(f"  With country: {with_country}", file=sys.stderr)
+    print(f"  Total:         {len(merged)}", file=sys.stderr)
+    print(f"  Accredited:    {accredited}", file=sys.stderr)
+    print(f"  Terminated:    {terminated}", file=sys.stderr)
+    print(f"  With website:  {with_website}", file=sys.stderr)
+    print(f"  With country:  {with_country}", file=sys.stderr)
+    print(f"  With whois:    {with_whois}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
