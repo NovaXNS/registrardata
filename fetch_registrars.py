@@ -252,8 +252,20 @@ def fetch_whois_servers(records: dict) -> dict:
 # ---------------------------------------------------------------------------
 # 4. Export JSON
 # ---------------------------------------------------------------------------
+def _strip_empty(obj):
+    """Recursively remove keys with None or '' values, and empty containers."""
+    if isinstance(obj, dict):
+        cleaned = {k: _strip_empty(v) for k, v in obj.items() if v is not None and v != ""}
+        return {k: v for k, v in cleaned.items() if v != {} and v != []}
+    if isinstance(obj, list):
+        cleaned = [_strip_empty(i) for i in obj]
+        return [i for i in cleaned if i != {} and i != []]
+    return obj
+
+
 def write_json(records, path):
     lst = sorted(records.values(), key=lambda r: r["iana_id"] if isinstance(r["iana_id"], int) else 0)
+    lst = [_strip_empty(r) for r in lst]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(lst, f, indent=2, ensure_ascii=False)
     print(f"  → {len(lst)} registrars written to {path}", file=sys.stderr)
