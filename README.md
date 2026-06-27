@@ -25,10 +25,11 @@ Each entry contains:
 - `iana_id` — IANA registrar number
 - `registrar_name` — official registrar name
 - `status` — Accredited, Terminated, or Reserved
-- `website` — registrar's website URL
-- `rdap_url` — RDAP base URL
-- `whois_server` — WHOIS server hostname (probed from RDAP port43 field, may be null)
-- `country` — country of registration
-- `contact.name` — public contact person
-- `contact.phone` — contact phone number
-- `contact.email` — contact email address
+- `website` — registrar's website URL (optional)
+- `rdap_url` — RDAP base URL (optional)
+- `whois_server` — WHOIS server hostname (probed from RDAP port43, optional)
+- `country` — country of registration (optional)
+- `contact` — contact info (optional)
+  - `name` — public contact person
+  - `phone` — contact phone number
+  - `email` — contact email address
